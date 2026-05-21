@@ -19,7 +19,7 @@ class TestGPUOutputParser(unittest.TestCase):
             "    1 root\n"
             "12345 alice\n"
         )
-        gpus, processes = parse_output(stdout)
+        gpus, processes, quotas, disks = parse_output(stdout)
 
         # Assert GPU details
         self.assertEqual(len(gpus), 2)
@@ -51,7 +51,7 @@ class TestGPUOutputParser(unittest.TestCase):
             "---\n"
             "---\n"
         )
-        gpus, processes = parse_output(stdout)
+        gpus, processes, quotas, disks = parse_output(stdout)
         self.assertEqual(len(gpus), 1)
         self.assertEqual(gpus[0]["power_draw"], "[Not Supported]")
         self.assertEqual(gpus[0]["power_limit"], "[Not Supported]")
@@ -64,15 +64,59 @@ class TestGPUOutputParser(unittest.TestCase):
             "---\n"
             "  PID USER\n"
         )
-        gpus, processes = parse_output(stdout)
+        gpus, processes, quotas, disks = parse_output(stdout)
         self.assertEqual(len(gpus), 1)
         self.assertEqual(len(processes), 0)
 
     def test_nvidia_smi_not_found(self):
         stdout = "ERROR: nvidia-smi not found"
-        with self.assertRaises(ValueError) as context:
-            parse_output(stdout)
-        self.assertIn("ERROR: nvidia-smi not found", str(context.exception))
+        gpus, processes, quotas, disks = parse_output(stdout)
+        self.assertEqual(len(gpus), 0)
+        self.assertEqual(len(processes), 0)
+        self.assertEqual(len(quotas), 0)
+        self.assertEqual(len(disks), 0)
+
+    def test_quota_and_df_parsing(self):
+        stdout = (
+            "ERROR: nvidia-smi not found\n"
+            "---\n"
+            "---\n"
+            "---\n"
+            "Disk quotas for user test_user (uid 1001):\n"
+            "     Filesystem   space   quota   limit   grace   files   quota   limit   grace\n"
+            " /dev/mock_disk1   200G*  250G   300G           1000       0       0\n"
+            "---\n"
+            "Filesystem           Size  Used Avail Use% Mounted on\n"
+            "/dev/mock_disk1       2.0T  1.2T  800G  60% /data\n"
+            "/dev/mock_disk2       500G  100G  400G  20% /home\n"
+        )
+        gpus, processes, quotas, disks = parse_output(stdout)
+        
+        self.assertEqual(len(gpus), 0)
+        self.assertEqual(len(processes), 0)
+        
+        # Assert quotas
+        self.assertEqual(len(quotas), 1)
+        self.assertEqual(quotas[0]["filesystem"], "/dev/mock_disk1")
+        self.assertEqual(quotas[0]["used"], "200G")
+        self.assertEqual(quotas[0]["soft"], "250G")
+        self.assertEqual(quotas[0]["hard"], "300G")
+        
+        # Assert disks
+        self.assertEqual(len(disks), 2)
+        self.assertEqual(disks[0]["filesystem"], "/dev/mock_disk1")
+        self.assertEqual(disks[0]["size"], "2.0T")
+        self.assertEqual(disks[0]["used"], "1.2T")
+        self.assertEqual(disks[0]["avail"], "800G")
+        self.assertEqual(disks[0]["use_pct"], 60)
+        self.assertEqual(disks[0]["mounted"], "/data")
+        
+        self.assertEqual(disks[1]["filesystem"], "/dev/mock_disk2")
+        self.assertEqual(disks[1]["size"], "500G")
+        self.assertEqual(disks[1]["used"], "100G")
+        self.assertEqual(disks[1]["avail"], "400G")
+        self.assertEqual(disks[1]["use_pct"], 20)
+        self.assertEqual(disks[1]["mounted"], "/home")
 
 
 if __name__ == "__main__":

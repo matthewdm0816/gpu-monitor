@@ -68,22 +68,33 @@ async def test_conn():
             print(result.stdout[:500] + "\n...[truncated in console]...")
             print("----------------------\n")
             
-            if "ERROR: nvidia-smi not found" in result.stdout:
-                print("Error: nvidia-smi is not available on the remote host.")
-            else:
-                gpus, processes = parse_output(result.stdout)
-                print("--- PARSED GPU DATA ---")
-                for gpu in gpus:
-                    print(f"GPU {gpu['index']}: {gpu['name']}")
-                    print(f"  Temp: {gpu['temp']}°C | Power: {gpu['power_draw']}W / {gpu['power_limit']}W")
-                    print(f"  Util: {gpu['gpu_util']}% | VRAM: {gpu['mem_used']} / {gpu['mem_total']} MiB ({gpu['mem_pct']}%)")
+            gpus, processes, quotas, disks = parse_output(result.stdout)
+            print("--- PARSED GPU DATA ---")
+            for gpu in gpus:
+                print(f"GPU {gpu['index']}: {gpu['name']}")
+                print(f"  Temp: {gpu['temp']}°C | Power: {gpu['power_draw']}W / {gpu['power_limit']}W")
+                print(f"  Util: {gpu['gpu_util']}% | VRAM: {gpu['mem_used']} / {gpu['mem_total']} MiB ({gpu['mem_pct']}%)")
+            if not gpus:
+                print("  No GPU details parsed (nvidia-smi error/missing).")
+            
+            print("\n--- PARSED PROCESS DATA ---")
+            for p in processes:
+                print(f"  GPU {p['gpu_index']} | PID {p['pid']} | User: {p['user']} | Process: {p['name']} | VRAM: {p['used_mem']} MiB")
+            if not processes:
+                print("  No active compute processes running.")
                 
-                print("\n--- PARSED PROCESS DATA ---")
-                for p in processes:
-                    print(f"  GPU {p['gpu_index']} | PID {p['pid']} | User: {p['user']} | Process: {p['name']} | VRAM: {p['used_mem']} MiB")
-                if not processes:
-                    print("  No active compute processes running.")
-                print("-----------------------")
+            print("\n--- PARSED QUOTA DATA ---")
+            for q in quotas:
+                print(f"  Filesystem: {q['filesystem']} | Used: {q['used']} | Soft: {q['soft']} | Hard: {q['hard']}")
+            if not quotas:
+                print("  No quotas found.")
+                
+            print("\n--- PARSED DISK DATA ---")
+            for d in disks:
+                print(f"  Filesystem: {d['filesystem']} | Size: {d['size']} | Used: {d['used']} | Avail: {d['avail']} | Use%: {d['use_pct']}% | Mounted: {d['mounted']}")
+            if not disks:
+                print("  No disk info found.")
+            print("-----------------------")
                 
     except Exception as e:
         print(f"\nConnection failed: {e}")
