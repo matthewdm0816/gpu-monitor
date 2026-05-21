@@ -53,7 +53,11 @@ async def test_conn():
                 "ps -eo pid,user 2>/dev/null || true; "
                 "else "
                 "echo 'ERROR: nvidia-smi not found'; "
-                "fi"
+                "fi; "
+                "echo '---'; "
+                "quota -w -s 2>/dev/null || quota -s 2>/dev/null || quota 2>/dev/null || true; "
+                "echo '---'; "
+                "df -h /data /home 2>/dev/null || true"
             )
             result = await conn.run(cmd)
             parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
