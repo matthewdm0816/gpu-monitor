@@ -1,0 +1,21 @@
+# GPU Monitor Configuration File
+
+# Refresh interval in seconds (how often to poll remote hosts)
+refresh_interval: 2.0
+
+# Connection timeout in seconds for SSH connections
+timeout: 5.0
+
+# Optional path to a custom SSH config file (defaults to ~/.ssh/config)
+ssh_config_path: "~/.ssh/config"
+
+# List of remote hosts to monitor
+# Note: Key-based authentication is forced. Ensure your private keys are added
+# to SSH Agent or configured in ssh_config or via 'key_file' below.
+hosts:
+  - name: "lab"
+    display_name: "Lab Server 128"
+  - name: "lab127"
+    display_name: "Lab Server 127"
+  - name: "lab126"
+    display_name: "Lab Server 126"
