@@ -61,6 +61,7 @@ def load_config():
         "refresh_interval": 2.0,
         "timeout": 5.0,
         "ssh_config_path": "~/.ssh/config",
+        "monitored_paths": ["/data", "/home"],
         "hosts": []
     }
 

@@ -9,6 +9,11 @@ timeout: 5.0
 # Optional path to a custom SSH config file (defaults to ~/.ssh/config)
 ssh_config_path: "~/.ssh/config"
 
+# Default directory paths to monitor remaining space on each server
+monitored_paths:
+  - "/data"
+  - "/home"
+
 # List of remote hosts to monitor
 # Note: Key-based authentication is forced. Ensure your private keys are added
 # to SSH Agent or configured in ssh_config or via 'key_file' below.
