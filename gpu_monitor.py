@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import asyncio
+import getpass
 
 # Friendly dependency checks
 try:
@@ -104,21 +105,32 @@ def resolve_ssh_config(host_name, ssh_config_path="~/.ssh/config"):
     try:
         path = os.path.expanduser(ssh_config_path)
         if os.path.exists(path):
-            ssh_config = asyncssh.read_ssh_config(path)
-            config_opts = ssh_config.lookup(host_name)
+            from asyncssh.config import SSHClientConfig
+
+            ssh_config = SSHClientConfig.load(
+                None,
+                [path],
+                False,
+                False,
+                False,
+                getpass.getuser(),
+                (),
+                host_name,
+                (),
+            )
+            config_opts = ssh_config.get_options(False)
             
-            if 'hostname' in config_opts:
-                resolved_host = config_opts['hostname']
-            if 'port' in config_opts:
-                conn_opts['port'] = int(config_opts['port'])
-            if 'user' in config_opts:
-                conn_opts['username'] = config_opts['user']
-            if 'identityfile' in config_opts:
-                id_files = config_opts['identityfile']
-                if isinstance(id_files, list):
-                    conn_opts['client_keys'] = [os.path.expanduser(x) for x in id_files]
-                else:
-                    conn_opts['client_keys'] = [os.path.expanduser(id_files)]
+            if config_opts.get('Hostname'):
+                resolved_host = str(config_opts['Hostname'])
+            if config_opts.get('Port'):
+                conn_opts['port'] = int(config_opts['Port'])
+            if config_opts.get('User'):
+                conn_opts['username'] = str(config_opts['User'])
+            if config_opts.get('IdentityFile'):
+                id_files = config_opts['IdentityFile']
+                if isinstance(id_files, (str, os.PathLike)):
+                    id_files = [id_files]
+                conn_opts['client_keys'] = [os.path.expanduser(str(x)) for x in id_files]
     except Exception:
         pass
     return resolved_host, conn_opts
@@ -482,7 +494,6 @@ class HostCard(Static):
                         (f"{used_gb:4.1f}/{total_gb:4.1f}G", "white"),
                         (f" ({mem_pct:2d}%)", f"bold {mem_color}")
                     )
-
                     # Dynamic compact process list
                     gpu_procs = [p for p in self.processes if p['gpu_index'] == gpu['index']]
                     proc_texts = []

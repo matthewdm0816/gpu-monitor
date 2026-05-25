@@ -1,13 +1,34 @@
 import os
 import sys
 import unittest
+import tempfile
 
 # Add parent directory to path so we can import from gpu_monitor
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_monitor import parse_output
+from gpu_monitor import parse_output, resolve_ssh_config
 
 
 class TestGPUOutputParser(unittest.TestCase):
+    def test_resolve_ssh_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            key_path = os.path.join(tmpdir, "id_test").replace("\\", "/")
+            cfg_path = os.path.join(tmpdir, "config")
+            with open(cfg_path, "w", encoding="utf-8") as f:
+                f.write(
+                    "Host lab\n"
+                    "  HostName 192.0.2.10\n"
+                    "  User testuser\n"
+                    "  Port 2200\n"
+                    f"  IdentityFile {key_path}\n"
+                )
+
+            host, opts = resolve_ssh_config("lab", cfg_path)
+
+        self.assertEqual(host, "192.0.2.10")
+        self.assertEqual(opts["username"], "testuser")
+        self.assertEqual(opts["port"], 2200)
+        self.assertEqual(opts["client_keys"], [key_path])
+
     def test_normal_output(self):
         stdout = (
             "0, GPU-12345, NVIDIA GeForce RTX 3090, 54, 12, 5, 24268, 1204, 85.34, 350.00\n"
