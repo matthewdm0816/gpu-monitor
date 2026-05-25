@@ -9,6 +9,6 @@ if not exist .venv (
     uv venv
 )
 echo Syncing dependencies...
-uv pip install -r requirements.txt
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
 echo Starting GPU Monitor...
 .venv\Scripts\python.exe gpu_monitor.py %*
