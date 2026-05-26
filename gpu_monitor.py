@@ -731,6 +731,8 @@ class GPUMonitorApp(App):
         self.host_cards = {}
         self._refreshing = False
         self.demo_mode = demo_mode
+        self._ssh_pool: dict[str, asyncssh.SSHClientConnection] = {}  # persistent SSH connections
+        self._ssh_locks: dict[str, asyncio.Lock] = {}  # per-host lock to prevent concurrent connect
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -750,6 +752,9 @@ class GPUMonitorApp(App):
         self.set_interval(self.refresh_interval, self.timer_refresh)
         # Tick the "last refresh" display every second
         self.set_interval(1.0, self.tick_last_refresh)
+
+    async def on_unmount(self) -> None:
+        await self._close_all_connections()
 
     async def timer_refresh(self) -> None:
         if not self.is_paused:
@@ -854,6 +859,89 @@ class GPUMonitorApp(App):
             "\n".join(df_lines)
         )
 
+    async def _get_ssh_conn(self, host_cfg) -> asyncssh.SSHClientConnection:
+        """Get a persistent SSH connection for a host, reusing if still alive."""
+        host_name = host_cfg['name']
+
+        # Return existing connection if still open
+        conn = self._ssh_pool.get(host_name)
+        if conn is not None and not conn.is_closed():
+            return conn
+
+        # Per-host lock to prevent duplicate connection attempts
+        if host_name not in self._ssh_locks:
+            self._ssh_locks[host_name] = asyncio.Lock()
+        async with self._ssh_locks[host_name]:
+            # Double-check after acquiring lock
+            conn = self._ssh_pool.get(host_name)
+            if conn is not None and not conn.is_closed():
+                return conn
+
+            # Resolve host details from ~/.ssh/config
+            resolved_host, conn_opts = resolve_ssh_config(host_name, self.ssh_config_path)
+
+            # Apply config.yaml overrides
+            if 'user' in host_cfg:
+                conn_opts['username'] = host_cfg['user']
+            if 'port' in host_cfg:
+                conn_opts['port'] = host_cfg['port']
+            if 'key_file' in host_cfg:
+                conn_opts['client_keys'] = [os.path.expanduser(host_cfg['key_file'])]
+
+            # Enforce key authentication (disable password prompt fallbacks)
+            conn_opts['password'] = None
+            conn_opts['preferred_auth'] = ['publickey']
+            conn_opts['known_hosts'] = None  # Disable host key check to avoid blocking
+            conn_opts['connect_timeout'] = self.conn_timeout
+
+            # Apply cryptographic overrides to avoid MAC errors on Windows
+            conn_opts['encryption_algs'] = ['aes256-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes128-ctr']
+            conn_opts['mac_algs'] = ['hmac-sha2-256', 'hmac-sha2-512']
+
+            # Check for configured/available keys
+            has_key = False
+            if 'client_keys' in conn_opts and conn_opts['client_keys']:
+                for key_path in conn_opts['client_keys']:
+                    if os.path.exists(key_path):
+                        has_key = True
+                    else:
+                        raise FileNotFoundError(f"Private key file not found: {key_path}")
+            else:
+                default_keys = [
+                    os.path.expanduser("~/.ssh/id_rsa"),
+                    os.path.expanduser("~/.ssh/id_dsa"),
+                    os.path.expanduser("~/.ssh/id_ecdsa"),
+                    os.path.expanduser("~/.ssh/id_ed25519"),
+                ]
+                if any(os.path.exists(k) for k in default_keys):
+                    has_key = True
+                else:
+                    try:
+                        agent = asyncssh.get_agent()
+                        agent_keys = await agent.get_keys()
+                        if agent_keys:
+                            has_key = True
+                    except Exception:
+                        pass
+
+            if not has_key:
+                raise ValueError(
+                    "No SSH private key configured or found. Key-based authentication is required.\n"
+                    "Please configure 'key_file' in config.yaml or ensure a default SSH key exists (e.g. ~/.ssh/id_rsa)."
+                )
+
+            conn = await asyncssh.connect(resolved_host, **conn_opts)
+            self._ssh_pool[host_name] = conn
+            return conn
+
+    async def _close_all_connections(self) -> None:
+        """Close all persistent SSH connections on app exit."""
+        for host_name, conn in self._ssh_pool.items():
+            if not conn.is_closed():
+                conn.close()
+                await conn.wait_closed()
+        self._ssh_pool.clear()
+
     async def update_host(self, host_cfg) -> None:
         card = self.host_cards.get(host_cfg['name'])
         if not card:
@@ -881,94 +969,40 @@ class GPUMonitorApp(App):
                 card.update_data(status="error", error_message=str(e), latency=latency)
             return
 
-        try:
-            host_name = host_cfg['name']
-            
-            # 1. Resolve host details from ~/.ssh/config
-            resolved_host, conn_opts = resolve_ssh_config(host_name, self.ssh_config_path)
-            
-            # 2. Apply config.yaml overrides
-            if 'user' in host_cfg:
-                conn_opts['username'] = host_cfg['user']
-            if 'port' in host_cfg:
-                conn_opts['port'] = host_cfg['port']
-            if 'key_file' in host_cfg:
-                conn_opts['client_keys'] = [os.path.expanduser(host_cfg['key_file'])]
+        host_name = host_cfg['name']
 
-            # Enforce key authentication (disable password prompt fallbacks)
-            conn_opts['password'] = None
-            conn_opts['preferred_auth'] = ['publickey']
-            conn_opts['known_hosts'] = None  # Disable host key check to avoid blocking
-            conn_opts['connect_timeout'] = self.conn_timeout
-            
-            # Apply cryptographic overrides to avoid MAC errors on Windows
-            conn_opts['encryption_algs'] = ['aes256-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes128-ctr']
-            conn_opts['mac_algs'] = ['hmac-sha2-256', 'hmac-sha2-512']
+        # Resolve paths to monitor for space
+        paths = host_cfg.get('monitored_paths') or self.config.get('monitored_paths') or ["/data", "/home"]
+        paths_str = " ".join(paths)
 
-            # Check for configured/available keys
-            has_key = False
-            if 'client_keys' in conn_opts and conn_opts['client_keys']:
-                # Validate explicitly specified keys
-                for key_path in conn_opts['client_keys']:
-                    if os.path.exists(key_path):
-                        has_key = True
-                    else:
-                        raise FileNotFoundError(f"Private key file not found: {key_path}")
-            else:
-                # Check default key files
-                default_keys = [
-                    os.path.expanduser("~/.ssh/id_rsa"),
-                    os.path.expanduser("~/.ssh/id_dsa"),
-                    os.path.expanduser("~/.ssh/id_ecdsa"),
-                    os.path.expanduser("~/.ssh/id_ed25519"),
-                ]
-                if any(os.path.exists(k) for k in default_keys):
-                    has_key = True
-                else:
-                    # Check SSH Agent
-                    try:
-                        agent = asyncssh.get_agent()
-                        agent_keys = await agent.get_keys()
-                        if agent_keys:
-                            has_key = True
-                    except Exception:
-                        pass
+        cmd = (
+            "if command -v nvidia-smi >/dev/null 2>&1; then "
+            "nvidia-smi --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,power.draw,power.limit --format=csv,noheader,nounits; "
+            "echo '---'; "
+            "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true; "
+            "echo '---'; "
+            "ps -eo pid,user 2>/dev/null || true; "
+            "else "
+            "echo 'ERROR: nvidia-smi not found'; "
+            "echo '---'; "
+            "echo ''; "
+            "echo '---'; "
+            "echo ''; "
+            "fi; "
+            "echo '---'; "
+            "quota -w -s 2>/dev/null || quota -s 2>/dev/null || quota 2>/dev/null || true; "
+            "echo '---'; "
+            f"df -h {paths_str} 2>/dev/null || true"
+        )
 
-            if not has_key:
-                raise ValueError(
-                    "No SSH private key configured or found. Key-based authentication is required.\n"
-                    "Please configure 'key_file' in config.yaml or ensure a default SSH key exists (e.g. ~/.ssh/id_rsa)."
-                )
-
-            # Resolve paths to monitor for space
-            paths = host_cfg.get('monitored_paths') or self.config.get('monitored_paths') or ["/data", "/home"]
-            paths_str = " ".join(paths)
-
-            async with asyncssh.connect(resolved_host, **conn_opts) as conn:
-                cmd = (
-                    "if command -v nvidia-smi >/dev/null 2>&1; then "
-                    "nvidia-smi --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,power.draw,power.limit --format=csv,noheader,nounits; "
-                    "echo '---'; "
-                    "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true; "
-                    "echo '---'; "
-                    "ps -eo pid,user 2>/dev/null || true; "
-                    "else "
-                    "echo 'ERROR: nvidia-smi not found'; "
-                    "echo '---'; "
-                    "echo ''; "
-                    "echo '---'; "
-                    "echo ''; "
-                    "fi; "
-                    "echo '---'; "
-                    "quota -w -s 2>/dev/null || quota -s 2>/dev/null || quota 2>/dev/null || true; "
-                    "echo '---'; "
-                    f"df -h {paths_str} 2>/dev/null || true"
-                )
+        for attempt in range(2):
+            try:
+                conn = await self._get_ssh_conn(host_cfg)
                 result = await conn.run(cmd)
                 stdout = result.stdout
-                
+
                 latency = time.perf_counter() - start_time
-                
+
                 gpus, processes, quotas, disks = parse_output(stdout)
                 card.update_data(
                     status="online",
@@ -978,36 +1012,49 @@ class GPUMonitorApp(App):
                     disks=disks,
                     latency=latency
                 )
-        except asyncssh.PermissionDenied as e:
-            latency = time.perf_counter() - start_time
-            card.update_data(
-                status="error",
-                error_message="Authentication failed. Key-based authentication is required.\n"
-                              "Make sure your public key is added to the remote ~/.ssh/authorized_keys\n"
-                              "and your private key is loaded in SSH Agent or configured in config.yaml.",
-                latency=latency
-            )
-        except (asyncssh.TimeoutError, asyncio.TimeoutError) as e:
-            latency = time.perf_counter() - start_time
-            card.update_data(
-                status="offline",
-                error_message=f"Connection timed out (>{self.conn_timeout}s).",
-                latency=latency
-            )
-        except FileNotFoundError as e:
-            latency = time.perf_counter() - start_time
-            card.update_data(
-                status="error",
-                error_message=str(e),
-                latency=latency
-            )
-        except Exception as e:
-            latency = time.perf_counter() - start_time
-            card.update_data(
-                status="error",
-                error_message=f"Connection failed: {str(e)}",
-                latency=latency
-            )
+                return  # success, done
+            except asyncssh.PermissionDenied as e:
+                latency = time.perf_counter() - start_time
+                card.update_data(
+                    status="error",
+                    error_message="Authentication failed. Key-based authentication is required.\n"
+                                  "Make sure your public key is added to the remote ~/.ssh/authorized_keys\n"
+                                  "and your private key is loaded in SSH Agent or configured in config.yaml.",
+                    latency=latency
+                )
+                return  # auth error won't self-heal, don't retry
+            except (asyncssh.TimeoutError, asyncio.TimeoutError) as e:
+                # Evict dead connection and retry once
+                self._ssh_pool.pop(host_name, None)
+                if attempt == 0:
+                    continue
+                latency = time.perf_counter() - start_time
+                card.update_data(
+                    status="offline",
+                    error_message=f"Connection timed out (>{self.conn_timeout}s).",
+                    latency=latency
+                )
+                return
+            except FileNotFoundError as e:
+                latency = time.perf_counter() - start_time
+                card.update_data(
+                    status="error",
+                    error_message=str(e),
+                    latency=latency
+                )
+                return  # config error won't self-heal, don't retry
+            except Exception as e:
+                # Evict possibly dead connection and retry once
+                self._ssh_pool.pop(host_name, None)
+                if attempt == 0:
+                    continue
+                latency = time.perf_counter() - start_time
+                card.update_data(
+                    status="error",
+                    error_message=f"Connection failed: {str(e)}",
+                    latency=latency
+                )
+                return
 
     def action_refresh(self) -> None:
         """Force immediate refresh."""
