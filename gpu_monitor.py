@@ -377,6 +377,7 @@ class HostCard(Static):
         self.quotas = []
         self.disks = []
         self.latency = 0.0
+        self.last_refresh_time = 0.0
 
     def update_data(self, status, gpus=None, processes=None, quotas=None, disks=None, error_message="", latency=0.0):
         self.status = status
@@ -386,7 +387,25 @@ class HostCard(Static):
         self.disks = disks or []
         self.error_message = error_message
         self.latency = latency
+        self.last_refresh_time = time.time()
         self.refresh(layout=True)
+
+    @staticmethod
+    def _format_ago(seconds):
+        if seconds < 60:
+            return f"{seconds:.0f}s ago"
+        elif seconds < 3600:
+            m = int(seconds // 60)
+            s = int(seconds % 60)
+            return f"{m}m {s}s ago"
+        elif seconds < 86400:
+            h = int(seconds // 3600)
+            m = int((seconds % 3600) // 60)
+            return f"{h}h {m}m ago"
+        else:
+            d = int(seconds // 86400)
+            h = int((seconds % 86400) // 3600)
+            return f"{d}d {h}h ago"
 
     def render(self) -> Panel:
         status_symbols = {
@@ -412,7 +431,8 @@ class HostCard(Static):
         )
         
         if self.status == "online":
-            title_text.append(Text(f" - {self.latency*1000:.0f}ms", style="dim green"))
+            ago = self._format_ago(time.time() - self.last_refresh_time)
+            title_text.append(Text(f" - {self.latency*1000:.0f}ms - {ago}", style="dim green"))
         elif self.status == "connecting":
             title_text.append(Text(" - Connecting...", style="dim yellow"))
         elif self.status == "offline":
@@ -728,10 +748,16 @@ class GPUMonitorApp(App):
         self.run_worker(self.refresh_data())
         # Set up repeating refresh timer
         self.set_interval(self.refresh_interval, self.timer_refresh)
+        # Tick the "last refresh" display every second
+        self.set_interval(1.0, self.tick_last_refresh)
 
     async def timer_refresh(self) -> None:
         if not self.is_paused:
             self.run_worker(self.refresh_data())
+
+    def tick_last_refresh(self) -> None:
+        for card in self.host_cards.values():
+            card.refresh(layout=False)
 
     async def refresh_data(self, force=False) -> None:
         if self._refreshing and not force:
