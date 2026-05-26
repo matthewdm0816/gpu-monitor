@@ -729,10 +729,10 @@ class GPUMonitorApp(App):
         self.ssh_config_path = config.get('ssh_config_path', '~/.ssh/config')
         self.is_paused = False
         self.host_cards = {}
-        self._refreshing = False
         self.demo_mode = demo_mode
-        self._ssh_pool: dict[str, asyncssh.SSHClientConnection] = {}  # persistent SSH connections
-        self._ssh_locks: dict[str, asyncio.Lock] = {}  # per-host lock to prevent concurrent connect
+        self._ssh_pool: dict[str, asyncssh.SSHClientConnection] = {}
+        self._ssh_locks: dict[str, asyncio.Lock] = {}
+        self._host_tasks: list[asyncio.Task] = []  # per-host background loops
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -746,34 +746,31 @@ class GPUMonitorApp(App):
         yield Footer()
 
     async def on_mount(self) -> None:
-        # Trigger first refresh
-        self.run_worker(self.refresh_data())
-        # Set up repeating refresh timer
-        self.set_interval(self.refresh_interval, self.timer_refresh)
+        # Each host runs its own independent refresh loop
+        for host in self.hosts:
+            task = asyncio.create_task(self._host_loop(host))
+            self._host_tasks.append(task)
         # Tick the "last refresh" display every second
         self.set_interval(1.0, self.tick_last_refresh)
 
-    async def on_unmount(self) -> None:
-        await self._close_all_connections()
+    async def _host_loop(self, host_cfg) -> None:
+        """Independent refresh loop for a single host. A slow host cannot block others."""
+        # First update immediately
+        await self.update_host(host_cfg)
+        while True:
+            await asyncio.sleep(self.refresh_interval)
+            if not self.is_paused:
+                await self.update_host(host_cfg)
 
-    async def timer_refresh(self) -> None:
-        if not self.is_paused:
-            self.run_worker(self.refresh_data())
+    async def on_unmount(self) -> None:
+        for task in self._host_tasks:
+            task.cancel()
+        await asyncio.gather(*self._host_tasks, return_exceptions=True)
+        await self._close_all_connections()
 
     def tick_last_refresh(self) -> None:
         for card in self.host_cards.values():
             card.refresh(layout=False)
-
-    async def refresh_data(self, force=False) -> None:
-        if self._refreshing and not force:
-            return
-        self._refreshing = True
-        
-        # Parallelize connections across all hosts
-        tasks = [self.update_host(host) for host in self.hosts]
-        await asyncio.gather(*tasks)
-        
-        self._refreshing = False
 
     def generate_mock_output(self, host_name):
         """Generates dynamic fluctuation data for demonstration/mock mode."""
@@ -877,10 +874,20 @@ class GPUMonitorApp(App):
             if conn is not None and not conn.is_closed():
                 return conn
 
-            # Resolve host details from ~/.ssh/config
-            resolved_host, conn_opts = resolve_ssh_config(host_name, self.ssh_config_path)
+            # Let asyncssh natively parse ~/.ssh/config (supports ProxyJump, ProxyCommand, etc.)
+            ssh_config_path = os.path.expanduser(self.ssh_config_path)
+            conn_opts = {
+                'config': [ssh_config_path],
+                'password': None,
+                'preferred_auth': ['publickey'],
+                'known_hosts': None,  # Disable host key check to avoid blocking
+                'connect_timeout': self.conn_timeout,
+                # Crypto overrides to avoid MAC errors on Windows
+                'encryption_algs': ['aes256-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes128-ctr'],
+                'mac_algs': ['hmac-sha2-256', 'hmac-sha2-512'],
+            }
 
-            # Apply config.yaml overrides
+            # Apply config.yaml overrides (take precedence over SSH config)
             if 'user' in host_cfg:
                 conn_opts['username'] = host_cfg['user']
             if 'port' in host_cfg:
@@ -888,49 +895,7 @@ class GPUMonitorApp(App):
             if 'key_file' in host_cfg:
                 conn_opts['client_keys'] = [os.path.expanduser(host_cfg['key_file'])]
 
-            # Enforce key authentication (disable password prompt fallbacks)
-            conn_opts['password'] = None
-            conn_opts['preferred_auth'] = ['publickey']
-            conn_opts['known_hosts'] = None  # Disable host key check to avoid blocking
-            conn_opts['connect_timeout'] = self.conn_timeout
-
-            # Apply cryptographic overrides to avoid MAC errors on Windows
-            conn_opts['encryption_algs'] = ['aes256-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes128-ctr']
-            conn_opts['mac_algs'] = ['hmac-sha2-256', 'hmac-sha2-512']
-
-            # Check for configured/available keys
-            has_key = False
-            if 'client_keys' in conn_opts and conn_opts['client_keys']:
-                for key_path in conn_opts['client_keys']:
-                    if os.path.exists(key_path):
-                        has_key = True
-                    else:
-                        raise FileNotFoundError(f"Private key file not found: {key_path}")
-            else:
-                default_keys = [
-                    os.path.expanduser("~/.ssh/id_rsa"),
-                    os.path.expanduser("~/.ssh/id_dsa"),
-                    os.path.expanduser("~/.ssh/id_ecdsa"),
-                    os.path.expanduser("~/.ssh/id_ed25519"),
-                ]
-                if any(os.path.exists(k) for k in default_keys):
-                    has_key = True
-                else:
-                    try:
-                        agent = asyncssh.get_agent()
-                        agent_keys = await agent.get_keys()
-                        if agent_keys:
-                            has_key = True
-                    except Exception:
-                        pass
-
-            if not has_key:
-                raise ValueError(
-                    "No SSH private key configured or found. Key-based authentication is required.\n"
-                    "Please configure 'key_file' in config.yaml or ensure a default SSH key exists (e.g. ~/.ssh/id_rsa)."
-                )
-
-            conn = await asyncssh.connect(resolved_host, **conn_opts)
+            conn = await asyncssh.connect(host_name, **conn_opts)
             self._ssh_pool[host_name] = conn
             return conn
 
@@ -1057,9 +1022,10 @@ class GPUMonitorApp(App):
                 return
 
     def action_refresh(self) -> None:
-        """Force immediate refresh."""
+        """Force immediate refresh of all hosts."""
         self.notify("Refreshing all servers...", severity="info")
-        self.run_worker(self.refresh_data(force=True))
+        for host in self.hosts:
+            self.run_worker(self.update_host(host))
 
     def action_toggle_pause(self) -> None:
         """Pause or resume automatic updates."""
