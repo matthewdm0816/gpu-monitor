@@ -5,7 +5,7 @@ import tempfile
 
 # Add parent directory to path so we can import from gpu_monitor
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_monitor import parse_output, resolve_ssh_config
+from gpu_monitor import build_monitor_command, parse_output, resolve_ssh_config
 
 
 class TestGPUOutputParser(unittest.TestCase):
@@ -181,6 +181,25 @@ class TestGPUOutputParser(unittest.TestCase):
         self.assertEqual(processes[0]["gpu_index"], 0)
         self.assertEqual(processes[0]["pid"], 2479700)
         self.assertEqual(processes[0]["user"], "alice")
+
+    def test_build_monitor_command_auto_detects_gpu_then_npu(self):
+        cmd = build_monitor_command({"name": "hw"}, {"monitored_paths": ["/data"]})
+        self.assertIn("command -v nvidia-smi", cmd)
+        self.assertIn("command -v npu-smi", cmd)
+        self.assertIn("BACKEND:nvidia", cmd)
+        self.assertIn("BACKEND:npu", cmd)
+        self.assertIn("df -h /data", cmd)
+
+    def test_build_monitor_command_npu_override_requires_npu_smi(self):
+        cmd = build_monitor_command({"name": "hw", "accelerator": "npu"}, {"monitored_paths": ["/data"]})
+        self.assertIn("ERROR: npu-smi not found", cmd)
+        self.assertNotIn("command -v nvidia-smi", cmd)
+
+    def test_build_monitor_command_none_skips_accelerator_tools(self):
+        cmd = build_monitor_command({"name": "storage", "accelerator": "none"}, {"monitored_paths": ["/data"]})
+        self.assertIn("BACKEND:none", cmd)
+        self.assertNotIn("nvidia-smi --query-gpu", cmd)
+        self.assertNotIn("npu-smi info", cmd)
 
 
 if __name__ == "__main__":

@@ -479,6 +479,99 @@ def parse_output(stdout):
     return gpus, processes, quotas, disks
 
 
+def build_monitor_command(host_cfg, config):
+    """
+    Builds the remote collection command for accelerator, process owner, quota, and df data.
+    """
+    paths = host_cfg.get('monitored_paths') or config.get('monitored_paths') or ["/data", "/home"]
+    paths_str = " ".join(paths)
+    accelerator = str(host_cfg.get("accelerator", "auto")).strip().lower()
+    if accelerator not in {"auto", "gpu", "npu", "none"}:
+        raise ValueError(
+            f"Unsupported accelerator mode '{accelerator}' for host {host_cfg.get('name', '<unknown>')}. "
+            "Expected one of: auto, gpu, npu, none."
+        )
+
+    nvidia_gpu_query = (
+        "nvidia-smi --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,"
+        "utilization.memory,memory.total,memory.used,power.draw,power.limit --format=csv,noheader,nounits"
+    )
+    nvidia_proc_query = (
+        "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory "
+        "--format=csv,noheader,nounits 2>/dev/null || true"
+    )
+
+    nvidia_sections = (
+        "echo 'BACKEND:nvidia'; "
+        f"{nvidia_gpu_query}; "
+        "echo '---'; "
+        f"{nvidia_proc_query}"
+    )
+    nvidia_missing = (
+        "echo 'BACKEND:nvidia'; "
+        "echo 'ERROR: nvidia-smi not found'; "
+        "echo '---'; "
+        "echo ''"
+    )
+    npu_sections = (
+        "echo 'BACKEND:npu'; "
+        "npu-smi info; "
+        "echo '---'; "
+        "echo ''"
+    )
+    npu_missing = (
+        "echo 'BACKEND:npu'; "
+        "echo 'ERROR: npu-smi not found'; "
+        "echo '---'; "
+        "echo ''"
+    )
+    none_sections = (
+        "echo 'BACKEND:none'; "
+        "echo 'ERROR: accelerator monitoring disabled or no accelerator tool found'; "
+        "echo '---'; "
+        "echo ''"
+    )
+
+    if accelerator == "auto":
+        accelerator_cmd = (
+            "if command -v nvidia-smi >/dev/null 2>&1; then "
+            f"{nvidia_sections}; "
+            "elif command -v npu-smi >/dev/null 2>&1; then "
+            f"{npu_sections}; "
+            "else "
+            f"{none_sections}; "
+            "fi"
+        )
+    elif accelerator == "gpu":
+        accelerator_cmd = (
+            "if command -v nvidia-smi >/dev/null 2>&1; then "
+            f"{nvidia_sections}; "
+            "else "
+            f"{nvidia_missing}; "
+            "fi"
+        )
+    elif accelerator == "npu":
+        accelerator_cmd = (
+            "if command -v npu-smi >/dev/null 2>&1; then "
+            f"{npu_sections}; "
+            "else "
+            f"{npu_missing}; "
+            "fi"
+        )
+    else:
+        accelerator_cmd = none_sections
+
+    return (
+        f"{accelerator_cmd}; "
+        "echo '---'; "
+        "ps -eo pid,user 2>/dev/null || true; "
+        "echo '---'; "
+        "quota -w -s 2>/dev/null || quota -s 2>/dev/null || quota 2>/dev/null || true; "
+        "echo '---'; "
+        f"df -h {paths_str} 2>/dev/null || true"
+    )
+
+
 class HostCard(Static):
     """
     Widget to represent a remote host card containing status and GPU tables.
@@ -1054,29 +1147,7 @@ class GPUMonitorApp(App):
 
         host_name = host_cfg['name']
 
-        # Resolve paths to monitor for space
-        paths = host_cfg.get('monitored_paths') or self.config.get('monitored_paths') or ["/data", "/home"]
-        paths_str = " ".join(paths)
-
-        cmd = (
-            "if command -v nvidia-smi >/dev/null 2>&1; then "
-            "nvidia-smi --query-gpu=index,uuid,name,temperature.gpu,utilization.gpu,utilization.memory,memory.total,memory.used,power.draw,power.limit --format=csv,noheader,nounits; "
-            "echo '---'; "
-            "nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_gpu_memory --format=csv,noheader,nounits 2>/dev/null || true; "
-            "echo '---'; "
-            "ps -eo pid,user 2>/dev/null || true; "
-            "else "
-            "echo 'ERROR: nvidia-smi not found'; "
-            "echo '---'; "
-            "echo ''; "
-            "echo '---'; "
-            "echo ''; "
-            "fi; "
-            "echo '---'; "
-            "quota -w -s 2>/dev/null || quota -s 2>/dev/null || quota 2>/dev/null || true; "
-            "echo '---'; "
-            f"df -h {paths_str} 2>/dev/null || true"
-        )
+        cmd = build_monitor_command(host_cfg, self.config)
 
         for attempt in range(2):
             try:
