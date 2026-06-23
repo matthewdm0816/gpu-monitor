@@ -654,15 +654,19 @@ class HostCard(Static):
         if self.status == "online":
             elements = []
             if not self.gpus:
-                elements.append(Text("No NVIDIA GPUs found or drivers not loaded.", style="dim italic"))
+                elements.append(Text("No accelerator devices found or drivers not loaded.", style="dim italic"))
             else:
+                accelerator_label = self.gpus[0].get("accelerator_type", "GPU")
+                memory_label = self.gpus[0].get("memory_label", "VRAM")
+                util_label = "AICore Util" if accelerator_label == "NPU" else "GPU Util"
+
                 table = Table(box=None, expand=True, padding=(0, 1))
-                table.add_column("ID", width=3, justify="right", style="cyan")
+                table.add_column(accelerator_label, width=3, justify="right", style="cyan")
                 table.add_column("Model", width=25, style="bold white")
                 table.add_column("Temp", width=7, justify="right")
                 table.add_column("Power", width=12, justify="right")
-                table.add_column("GPU Util", width=18)
-                table.add_column("VRAM Util", width=28)
+                table.add_column(util_label, width=18)
+                table.add_column(f"{memory_label} Util", width=28)
                 table.add_column("Processes", style="dim white")
 
                 for gpu in self.gpus:

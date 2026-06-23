@@ -2,10 +2,14 @@ import os
 import sys
 import unittest
 import tempfile
+import time
+import io
+
+from rich.console import Console
 
 # Add parent directory to path so we can import from gpu_monitor
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_monitor import build_monitor_command, parse_output, resolve_ssh_config
+from gpu_monitor import HostCard, build_monitor_command, parse_output, resolve_ssh_config
 
 
 class TestGPUOutputParser(unittest.TestCase):
@@ -200,6 +204,38 @@ class TestGPUOutputParser(unittest.TestCase):
         self.assertIn("BACKEND:none", cmd)
         self.assertNotIn("nvidia-smi --query-gpu", cmd)
         self.assertNotIn("npu-smi info", cmd)
+
+    def test_host_card_renders_npu_labels(self):
+        card = HostCard({"name": "hw", "display_name": "HW Ascend"})
+        card.status = "online"
+        card.latency = 0.01
+        card.last_refresh_time = time.time()
+        card.gpus = [{
+            "index": 0,
+            "uuid": "NPU-0-0",
+            "name": "910B1",
+            "temp": 50,
+            "gpu_util": 12,
+            "mem_total": 65536,
+            "mem_used": 3494,
+            "mem_pct": 5,
+            "power_draw": "92.6",
+            "power_limit": "N/A",
+            "accelerator_type": "NPU",
+            "memory_label": "HBM",
+        }]
+        card.processes = []
+        card.quotas = []
+        card.disks = []
+
+        console = Console(record=True, width=140, file=io.StringIO(), force_terminal=False)
+        console.print(card.render())
+        rendered = console.export_text()
+
+        self.assertIn("AICore Util", rendered)
+        self.assertIn("HBM Util", rendered)
+        self.assertNotIn("GPU Util", rendered)
+        self.assertNotIn("VRAM Util", rendered)
 
 
 if __name__ == "__main__":
