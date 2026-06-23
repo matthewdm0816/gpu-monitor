@@ -993,19 +993,82 @@ class GPUMonitorApp(App):
         # Seed by hash of host name + current time block (updates every 2s)
         time_block = int(time.time() / 2.0)
         random.seed(hash(host_name) + time_block)
+
+        host_cfg = next((h for h in self.hosts if h['name'] == host_name), {})
+        accelerator = str(host_cfg.get("accelerator", "gpu")).strip().lower()
+        paths = host_cfg.get('monitored_paths') or self.config.get('monitored_paths') or ["/data", "/home"]
         
-        # Determine number of GPUs for this mock host
-        num_gpus = (hash(host_name) % 3) + 1  # 1 to 3 GPUs
+        # Determine number of accelerators for this mock host
+        num_gpus = (hash(host_name) % 3) + 1  # 1 to 3 accelerators
         
-        gpu_lines = []
+        gpu_lines = ["BACKEND:nvidia"]
         proc_lines = []
         pids = []
         
         users = ["alice", "bob", "charlie", "root", "dave"]
         procs = ["python", "jupyter-notebook", "torch_train", "llama-infer", "go-runner"]
+
+        if accelerator == "npu":
+            npu_lines = [
+                "BACKEND:npu",
+                "+------------------------------------------------------------------------------------------------+",
+                "| npu-smi demo                     Version: demo                                                 |",
+                "+---------------------------+---------------+----------------------------------------------------+",
+                "| NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|",
+                "| Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |",
+                "+===========================+===============+====================================================+",
+            ]
+
+            process_rows = []
+            for idx in range(num_gpus):
+                temp = random.randint(45, 72)
+                aicore = random.randint(0, 100)
+                hbm_total = 65536
+                hbm_used = random.randint(int(hbm_total * 0.05), int(hbm_total * 0.85))
+                p_draw = random.uniform(80.0, 260.0)
+                npu_lines.append(
+                    f"| {idx:<5} 910B1               | OK            | {p_draw:<11.1f} {temp:<17d} 0    / 0             |"
+                )
+                npu_lines.append(
+                    f"| 0                         | 0000:{idx:02X}:00.0  | {aicore:<11d} 0    / 0          {hbm_used} / {hbm_total}         |"
+                )
+                npu_lines.append("+===========================+===============+====================================================+")
+
+                if aicore > 5:
+                    pid = random.randint(10000, 99999)
+                    user = random.choice(users)
+                    pids.append((pid, user))
+                    proc_name = random.choice(procs)
+                    proc_mem = random.randint(100, max(100, int(hbm_used * 0.2)))
+                    process_rows.append(
+                        f"| {idx:<7} 0                 | {pid:<13} | {proc_name:<24} | {proc_mem:<23} |"
+                    )
+
+            npu_lines.extend([
+                "+---------------------------+---------------+----------------------------------------------------+",
+                "| NPU     Chip              | Process id    | Process name             | Process memory(MB)      |",
+                "+===========================+===============+====================================================+",
+            ])
+            for row in process_rows:
+                npu_lines.append(row)
+                npu_lines.append("+===========================+===============+====================================================+")
+
+            ps_lines = ["  PID USER"]
+            for pid, user in pids:
+                ps_lines.append(f"{pid} {user}")
+
+            df_lines, quota_lines = self._generate_mock_storage_lines(host_name, paths, random)
+            return (
+                "\n".join(npu_lines) + "\n---\n" +
+                "\n---\n" +
+                "\n".join(ps_lines) + "\n---\n" +
+                "\n".join(quota_lines) + "\n---\n" +
+                "\n".join(df_lines)
+            )
         
         for idx in range(num_gpus):
             model = ["NVIDIA A100-SXM4-80GB", "NVIDIA GeForce RTX 4090", "NVIDIA RTX 6000 Ada"][idx % 3]
+            gpu_uuid = f"GPU-DEMO-{idx}"
             temp = random.randint(45, 82)
             gpu_util = random.randint(0, 100)
             
@@ -1015,7 +1078,7 @@ class GPUMonitorApp(App):
             p_limit = [400, 450, 300][idx % 3]
             p_draw = random.uniform(p_limit * 0.15, p_limit * 0.95)
             
-            gpu_lines.append(f"{idx}, {model}, {temp}, {gpu_util}, 0, {total_mem}, {mem_used}, {p_draw:.2f}, {p_limit:.2f}")
+            gpu_lines.append(f"{idx}, {gpu_uuid}, {model}, {temp}, {gpu_util}, 0, {total_mem}, {mem_used}, {p_draw:.2f}, {p_limit:.2f}")
             
             # Processes on this GPU
             if gpu_util > 5:
@@ -1026,16 +1089,22 @@ class GPUMonitorApp(App):
                     pids.append((pid, user))
                     proc_name = random.choice(procs)
                     proc_mem = random.randint(500, int(mem_used / num_procs))
-                    proc_lines.append(f"{idx}, {pid}, {proc_name}, {proc_mem}")
+                    proc_lines.append(f"{gpu_uuid}, {pid}, {proc_name}, {proc_mem}")
         
         ps_lines = ["  PID USER"]
         for pid, user in pids:
             ps_lines.append(f"{pid} {user}")
             
-        # Get monitored paths
-        host_cfg = next((h for h in self.hosts if h['name'] == host_name), {})
-        paths = host_cfg.get('monitored_paths') or self.config.get('monitored_paths') or ["/data", "/home"]
-        
+        df_lines, quota_lines = self._generate_mock_storage_lines(host_name, paths, random)
+        return (
+            "\n".join(gpu_lines) + "\n---\n" +
+            "\n".join(proc_lines) + "\n---\n" +
+            "\n".join(ps_lines) + "\n---\n" +
+            "\n".join(quota_lines) + "\n---\n" +
+            "\n".join(df_lines)
+        )
+
+    def _generate_mock_storage_lines(self, host_name, paths, random):
         df_lines = ["Filesystem           Size  Used Avail Use% Mounted on"]
         for idx, path in enumerate(paths):
             size_gb = [2048, 1024, 512, 256][idx % 4]
@@ -1062,14 +1131,7 @@ class GPUMonitorApp(App):
         if used_q > soft_q:
             space_str += "*"
         quota_lines.append(f" /dev/mock_disk1   {space_str}   {soft_q}G   {hard_q}G           1000       0       0")
-        
-        return (
-            "\n".join(gpu_lines) + "\n---\n" +
-            "\n".join(proc_lines) + "\n---\n" +
-            "\n".join(ps_lines) + "\n---\n" +
-            "\n".join(quota_lines) + "\n---\n" +
-            "\n".join(df_lines)
-        )
+        return df_lines, quota_lines
 
     async def _get_ssh_conn(self, host_cfg) -> asyncssh.SSHClientConnection:
         """Get a persistent SSH connection for a host, reusing if still alive."""
@@ -1240,7 +1302,8 @@ if __name__ == "__main__":
         cfg["hosts"] = [
             {"name": "demo-server-1", "display_name": "Cluster-A Core-Node-01"},
             {"name": "demo-server-2", "display_name": "Cluster-A Gpu-Node-02"},
-            {"name": "demo-server-3", "display_name": "RTX-3090-Workstation"}
+            {"name": "demo-server-3", "display_name": "RTX-3090-Workstation"},
+            {"name": "demo-ascend-1", "display_name": "Ascend-910B-NPU-Node", "accelerator": "npu"}
         ]
         cfg["refresh_interval"] = 1.0  # speed up refresh for demo responsiveness
     

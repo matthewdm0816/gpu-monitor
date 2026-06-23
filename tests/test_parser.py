@@ -9,7 +9,7 @@ from rich.console import Console
 
 # Add parent directory to path so we can import from gpu_monitor
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from gpu_monitor import HostCard, build_monitor_command, parse_output, resolve_ssh_config
+from gpu_monitor import GPUMonitorApp, HostCard, build_monitor_command, parse_output, resolve_ssh_config
 
 
 class TestGPUOutputParser(unittest.TestCase):
@@ -236,6 +236,33 @@ class TestGPUOutputParser(unittest.TestCase):
         self.assertIn("HBM Util", rendered)
         self.assertNotIn("GPU Util", rendered)
         self.assertNotIn("VRAM Util", rendered)
+
+    def test_demo_npu_mock_output_parses_as_npu(self):
+        app = GPUMonitorApp({
+            "hosts": [{"name": "demo-npu", "display_name": "Demo Ascend", "accelerator": "npu"}],
+            "monitored_paths": ["/data"],
+        }, demo_mode=True)
+
+        stdout = app.generate_mock_output("demo-npu")
+        gpus, processes, quotas, disks = parse_output(stdout)
+
+        self.assertGreaterEqual(len(gpus), 1)
+        self.assertEqual(gpus[0]["accelerator_type"], "NPU")
+        self.assertEqual(gpus[0]["memory_label"], "HBM")
+
+    def test_demo_gpu_mock_output_keeps_gpu_model_fields(self):
+        app = GPUMonitorApp({
+            "hosts": [{"name": "demo-gpu", "display_name": "Demo GPU"}],
+            "monitored_paths": ["/data"],
+        }, demo_mode=True)
+
+        stdout = app.generate_mock_output("demo-gpu")
+        gpus, processes, quotas, disks = parse_output(stdout)
+
+        self.assertGreaterEqual(len(gpus), 1)
+        self.assertEqual(gpus[0]["accelerator_type"], "GPU")
+        self.assertEqual(gpus[0]["memory_label"], "VRAM")
+        self.assertTrue(gpus[0]["name"].startswith("NVIDIA"))
 
 
 if __name__ == "__main__":

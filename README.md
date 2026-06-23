@@ -1,16 +1,17 @@
-# Multi-Host SSH GPU & Storage Monitor (TUI)
+# Multi-Host SSH GPU/NPU & Storage Monitor (TUI)
 
-一个基于 Python Textual 构建的终端 TUI 监控工具，能够通过 SSH 同时监控多个远程服务器的 GPU 状态（显存、温度、使用率、功耗）、活跃进程（PID、所有者、使用显存）以及磁盘配额 (Quota) 和指定目录的剩余空间。
+一个基于 Python Textual 构建的终端 TUI 监控工具，能够通过 SSH 同时监控多个远程服务器的 GPU/NPU 状态（显存或 HBM、温度、使用率、功耗）、活跃进程（PID、所有者、使用显存/HBM）以及磁盘配额 (Quota) 和指定目录的剩余空间。
 
 ---
 
 ## 功能特性
 
 - **多主机集中监控**：在一个终端窗口中平铺显示多个远程服务器的运行状态。
-- **类似 `gpustat` 的展示**：直观展示每张 GPU 的使用率、温度、功耗与显存，并且基于 `GPU UUID` 准确匹配活跃进程的所有者与显存占用。
-- **存储与配额监控**：不仅监控 GPU，还支持获取当前用户在各服务器的磁盘配额 (Quota) 和指定挂载目录的剩余空间 (DF)。
+- **类似 `gpustat` 的展示**：直观展示每张 GPU/NPU 的使用率、温度、功耗与显存/HBM，并且基于设备标识准确匹配活跃进程的所有者与显存/HBM 占用。
+- **自动识别 NVIDIA GPU 与昇腾 NPU**：默认自动探测 `nvidia-smi` 与 `npu-smi`，也可以通过 `hosts[].accelerator` 强制指定 `gpu`、`npu` 或 `none`。
+- **存储与配额监控**：不仅监控 GPU/NPU，还支持获取当前用户在各服务器的磁盘配额 (Quota) 和指定挂载目录的剩余空间 (DF)。
 - **强健的容错性**：
-  - 支持没有 GPU 的纯 CPU/存储服务器，即使 `nvidia-smi` 报错或不存在，也会优雅显示并继续监控磁盘空间与配额。
+  - 支持没有 GPU/NPU 的纯 CPU/存储服务器，即使 `nvidia-smi` 和 `npu-smi` 都不存在，也会优雅显示并继续监控磁盘空间与配额。
   - 支持自适应高度布局，完美展现从 2 卡到 8 卡乃至 CPU 单板的各种规格服务器。
 - **安全的密钥认证**：强制使用私钥 SSH 认证，杜绝交互式密码输入，非常适合后台自动运行。若私钥缺失，提供友好的排查指导。
 - **模拟 Demo 模式**：支持免连接的本地 Demo 演示模式，动态模拟多卡及存储空间变化。
@@ -171,6 +172,7 @@ hosts:
   # --- 基本配置 ---
   - name: "gpu-server-1"           # 必填：对应 ~/.ssh/config 中的 Host 别名或 IP 地址
     display_name: "GPU Server 1"   # 可选：界面显示的友好名称（不填则使用 name）
+    accelerator: "auto"            # 可选：auto, gpu, npu, none；默认 auto 自动探测
 
   # --- 自定义监控路径 ---
   - name: "gpu-server-2"
@@ -178,6 +180,11 @@ hosts:
     monitored_paths:               # 可选：覆盖全局的 monitored_paths
       - "/data"
       - "/data2"
+
+  # --- 昇腾 NPU 服务器（npu-smi）---
+  - name: "hw"
+    display_name: "Ascend NPU Server"
+    accelerator: "npu"              # 可选；不写则 auto 会在无 nvidia-smi 时尝试 npu-smi
 
   # --- 最简配置（display_name 缺省时使用 name）---
   - name: "192.168.1.100"
@@ -201,6 +208,7 @@ hosts:
 | `hosts` | 否 | 自动读取 `~/.ssh/config` | 主机列表，不填时自动从 SSH config 读取所有 Host |
 | `hosts[].name` | **是** | - | 主机标识，匹配 `~/.ssh/config` 中的 Host 或直接填 IP |
 | `hosts[].display_name` | 否 | 与 `name` 相同 | 界面中显示的名称 |
+| `hosts[].accelerator` | 否 | `auto` | 加速卡采集模式：`auto` 自动探测，`gpu` 强制 `nvidia-smi`，`npu` 强制 `npu-smi`，`none` 跳过加速卡采集 |
 | `hosts[].monitored_paths` | 否 | 继承全局配置 | 该主机专属的监控目录，覆盖全局 `monitored_paths` |
 
 > **注意**：如果 `config.yaml` 不存在，程序会自动读取 `~/.ssh/config` 中的所有 Host 并生成默认配置文件。
@@ -236,9 +244,10 @@ hosts:
 - 如果使用非默认密钥，确保在 SSH config 中指定了 `IdentityFile`
 - 如果私钥有 passphrase，确保 `ssh-agent` 已启动并添加了密钥
 
-### `nvidia-smi` 不存在？
-- 完全没问题，程序会优雅降级，只显示磁盘配额和存储信息
-- 适用于纯 CPU 服务器、存储节点等场景
+### `nvidia-smi` 或 `npu-smi` 不存在？
+- 默认 `accelerator: auto` 会先尝试 `nvidia-smi`，再尝试 `npu-smi`
+- 两者都不存在时，程序会优雅降级，只显示磁盘配额和存储信息
+- 如果你明确知道主机类型，可以设置 `accelerator: "gpu"`、`accelerator: "npu"` 或 `accelerator: "none"`
 
 ### 刷新太慢/太快？
 - 调整 `config.yaml` 中的 `refresh_interval`，默认 2 秒

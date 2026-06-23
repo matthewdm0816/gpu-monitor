@@ -17,6 +17,8 @@ monitored_paths:
 # List of remote hosts to monitor
 # Note: Key-based authentication is forced. Ensure your private keys are added
 # to SSH Agent or configured in ssh_config or via 'key_file' below.
+# Optional per-host accelerator override:
+#   accelerator: "auto"  # auto, gpu, npu, none. Defaults to auto.
 hosts:
   - name: "lab"
     display_name: "Lab Server 128"
