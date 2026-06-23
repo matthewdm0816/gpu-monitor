@@ -139,6 +139,49 @@ class TestGPUOutputParser(unittest.TestCase):
         self.assertEqual(disks[1]["use_pct"], 20)
         self.assertEqual(disks[1]["mounted"], "/home")
 
+    def test_npu_smi_info_output(self):
+        stdout = (
+            "BACKEND:npu\n"
+            "+------------------------------------------------------------------------------------------------+\n"
+            "| npu-smi 24.1.0.3                 Version: 24.1.0.3                                             |\n"
+            "+---------------------------+---------------+----------------------------------------------------+\n"
+            "| NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|\n"
+            "| Chip                      | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |\n"
+            "+===========================+===============+====================================================+\n"
+            "| 0     910B1               | OK            | 92.6        50                0    / 0             |\n"
+            "| 0                         | 0000:C1:00.0  | 12          0    / 0          3494 / 65536         |\n"
+            "+===========================+===============+====================================================+\n"
+            "| 1     910B1               | OK            | 99.9        52                0    / 0             |\n"
+            "| 0                         | 0000:01:00.0  | 0           0    / 0          3475 / 65536         |\n"
+            "+===========================+===============+====================================================+\n"
+            "+---------------------------+---------------+----------------------------------------------------+\n"
+            "| NPU     Chip              | Process id    | Process name             | Process memory(MB)      |\n"
+            "+===========================+===============+====================================================+\n"
+            "| 0       0                 | 2479700       | python                   | 111                     |\n"
+            "+===========================+===============+====================================================+\n"
+            "---\n"
+            "---\n"
+            "  PID USER\n"
+            "2479700 alice\n"
+            "---\n"
+            "---\n"
+        )
+        gpus, processes, quotas, disks = parse_output(stdout)
+        self.assertEqual(len(gpus), 2)
+        self.assertEqual(gpus[0]["accelerator_type"], "NPU")
+        self.assertEqual(gpus[0]["memory_label"], "HBM")
+        self.assertEqual(gpus[0]["index"], 0)
+        self.assertEqual(gpus[0]["name"], "910B1")
+        self.assertEqual(gpus[0]["temp"], 50)
+        self.assertEqual(gpus[0]["gpu_util"], 12)
+        self.assertEqual(gpus[0]["mem_used"], 3494)
+        self.assertEqual(gpus[0]["mem_total"], 65536)
+        self.assertEqual(gpus[0]["power_draw"], "92.6")
+        self.assertEqual(gpus[0]["power_limit"], "N/A")
+        self.assertEqual(processes[0]["gpu_index"], 0)
+        self.assertEqual(processes[0]["pid"], 2479700)
+        self.assertEqual(processes[0]["user"], "alice")
+
 
 if __name__ == "__main__":
     unittest.main()

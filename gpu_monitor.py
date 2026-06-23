@@ -239,6 +239,118 @@ def parse_df_output(df_section):
     return disks
 
 
+def split_backend_marker(section):
+    """
+    Returns (backend, payload) from a section optionally prefixed with BACKEND:<name>.
+    Legacy output has no marker and is treated as NVIDIA CSV.
+    """
+    lines = section.splitlines()
+    if lines and lines[0].strip().startswith("BACKEND:"):
+        backend = lines[0].strip().split(":", 1)[1].strip().lower()
+        return backend, "\n".join(lines[1:])
+    return "nvidia", section
+
+
+def _split_npu_table_cells(line):
+    if not line.startswith("|"):
+        return []
+    return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+
+def parse_npu_smi_output(npu_section, pid_to_user):
+    """
+    Parses Ascend npu-smi info output into the existing GPU/process data contract.
+    """
+    gpus = []
+    processes = []
+    lines = npu_section.splitlines()
+    in_process_table = False
+
+    for idx, line in enumerate(lines):
+        if "Process id" in line and "Process memory" in line:
+            in_process_table = True
+            continue
+
+        cells = _split_npu_table_cells(line)
+        if not cells:
+            continue
+
+        if in_process_table:
+            if len(cells) < 4:
+                continue
+            npu_chip_match = re.match(r"^(\d+)\s+(\d+)$", cells[0])
+            if not npu_chip_match:
+                continue
+            try:
+                npu_idx = int(npu_chip_match.group(1))
+                pid = int(cells[1])
+                proc_name = cells[2]
+                used_mem = int(cells[3])
+            except ValueError:
+                continue
+            processes.append({
+                "gpu_index": npu_idx,
+                "pid": pid,
+                "name": proc_name,
+                "used_mem": used_mem,
+                "user": pid_to_user.get(pid, "unknown"),
+            })
+            continue
+
+        if len(cells) < 3:
+            continue
+
+        first_row_match = re.match(r"^(\d+)\s+(.+)$", cells[0])
+        if not first_row_match:
+            continue
+
+        next_cells = _split_npu_table_cells(lines[idx + 1]) if idx + 1 < len(lines) else []
+        if len(next_cells) < 3:
+            continue
+
+        metrics_match = re.match(
+            r"^([0-9.]+)\s+([0-9.]+)\s*/\s*([0-9.]+)\s+([0-9.]+)\s*/\s*([0-9.]+)$",
+            next_cells[2],
+        )
+        power_temp_match = re.match(r"^([0-9.]+)\s+([0-9]+)", cells[2])
+        if not metrics_match or not power_temp_match:
+            continue
+
+        try:
+            npu_idx = int(first_row_match.group(1))
+            name = first_row_match.group(2).strip()
+            chip = int(next_cells[0])
+            aicore_util = int(float(metrics_match.group(1)))
+            hbm_used = int(float(metrics_match.group(4)))
+            hbm_total = int(float(metrics_match.group(5)))
+            temp = int(power_temp_match.group(2))
+        except ValueError:
+            continue
+
+        mem_pct = int((hbm_used / hbm_total) * 100) if hbm_total > 0 else 0
+        gpus.append({
+            "index": npu_idx,
+            "uuid": f"NPU-{npu_idx}-{chip}",
+            "name": name,
+            "temp": temp,
+            "gpu_util": aicore_util,
+            "mem_total": hbm_total,
+            "mem_used": hbm_used,
+            "mem_pct": mem_pct,
+            "power_draw": power_temp_match.group(1),
+            "power_limit": "N/A",
+            "accelerator_type": "NPU",
+            "memory_label": "HBM",
+        })
+
+    return gpus, processes
+
+
+def split_output_sections(stdout):
+    """Splits remote output only on delimiter lines, preserving table borders."""
+    return re.split(r"(?m)^\s*---\s*$", stdout)
+
+
 def parse_output(stdout):
     """
     Parses the command output sections separated by '---'.
@@ -248,7 +360,7 @@ def parse_output(stdout):
     Section 4: Quota output
     Section 5: df output
     """
-    sections = stdout.split("---")
+    sections = split_output_sections(stdout)
     if len(sections) == 0:
         raise ValueError("Empty response received from remote host")
 
@@ -257,53 +369,7 @@ def parse_output(stdout):
     quotas = []
     disks = []
 
-    # 1. Parse GPUs (Section 0)
-    gpu_section = sections[0].strip()
-    is_gpu_error = gpu_section.startswith("ERROR:") or "nvidia-smi not found" in gpu_section
-    
-    uuid_to_index = {}
-    if not is_gpu_error:
-        for line in gpu_section.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 9:
-                continue
-
-            try:
-                gpu_idx = int(parts[0])
-                gpu_uuid = parts[1]
-                name = parts[2]
-                temp = int(parts[3]) if parts[3].isdigit() else 0
-                gpu_util = int(parts[4]) if parts[4].isdigit() else 0
-                
-                # Memory fields
-                total_mem = int(parts[6]) if parts[6].isdigit() else 0
-                used_mem = int(parts[7]) if parts[7].isdigit() else 0
-                mem_pct = int((used_mem / total_mem) * 100) if total_mem > 0 else 0
-                
-                # Power fields
-                power_draw = parts[8]
-                power_limit = parts[9] if len(parts) > 9 else "N/A"
-                
-                gpus.append({
-                    "index": gpu_idx,
-                    "uuid": gpu_uuid,
-                    "name": name,
-                    "temp": temp,
-                    "gpu_util": gpu_util,
-                    "mem_total": total_mem,
-                    "mem_used": used_mem,
-                    "mem_pct": mem_pct,
-                    "power_draw": power_draw,
-                    "power_limit": power_limit,
-                })
-                uuid_to_index[gpu_uuid] = gpu_idx
-            except ValueError:
-                continue
-
-    # 2. Parse User/Owner map (Section 2)
+    # 1. Parse User/Owner map (Section 2)
     pid_to_user = {}
     if len(sections) > 2:
         ps_section = sections[2].strip()
@@ -314,39 +380,91 @@ def parse_output(stdout):
                 if pid_str.isdigit():
                     pid_to_user[int(pid_str)] = user
 
-    # 3. Parse Active compute apps (Section 1)
-    if len(sections) > 1:
-        proc_section = sections[1].strip()
-        for line in proc_section.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 4:
-                continue
-            try:
-                gpu_uuid = parts[0]
-                pid = int(parts[1])
-                proc_name = parts[2]
-                used_mem = int(parts[3])
-                
-                # Resolve GPU index from UUID
-                gpu_idx = uuid_to_index.get(gpu_uuid, -1)
-                # If nvidia-smi failed or is missing, we don't have uuid_to_index,
-                # but we can still store processes with gpu_idx = -1 if needed.
-                if gpu_idx == -1 and not is_gpu_error:
+    # 2. Parse accelerator devices and processes.
+    gpu_section = sections[0].strip()
+    backend, gpu_section = split_backend_marker(gpu_section)
+    is_gpu_error = gpu_section.startswith("ERROR:") or "nvidia-smi not found" in gpu_section
+
+    uuid_to_index = {}
+    if backend == "npu":
+        gpus, processes = parse_npu_smi_output(gpu_section, pid_to_user)
+    elif backend != "none":
+        if not is_gpu_error:
+            for line in gpu_section.splitlines():
+                line = line.strip()
+                if not line:
                     continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 9:
+                    continue
+
+                try:
+                    gpu_idx = int(parts[0])
+                    gpu_uuid = parts[1]
+                    name = parts[2]
+                    temp = int(parts[3]) if parts[3].isdigit() else 0
+                    gpu_util = int(parts[4]) if parts[4].isdigit() else 0
                     
-                user = pid_to_user.get(pid, "unknown")
-                processes.append({
-                    "gpu_index": gpu_idx,
-                    "pid": pid,
-                    "name": proc_name,
-                    "used_mem": used_mem,
-                    "user": user,
-                })
-            except ValueError:
-                continue
+                    # Memory fields
+                    total_mem = int(parts[6]) if parts[6].isdigit() else 0
+                    used_mem = int(parts[7]) if parts[7].isdigit() else 0
+                    mem_pct = int((used_mem / total_mem) * 100) if total_mem > 0 else 0
+                    
+                    # Power fields
+                    power_draw = parts[8]
+                    power_limit = parts[9] if len(parts) > 9 else "N/A"
+                    
+                    gpus.append({
+                        "index": gpu_idx,
+                        "uuid": gpu_uuid,
+                        "name": name,
+                        "temp": temp,
+                        "gpu_util": gpu_util,
+                        "mem_total": total_mem,
+                        "mem_used": used_mem,
+                        "mem_pct": mem_pct,
+                        "power_draw": power_draw,
+                        "power_limit": power_limit,
+                        "accelerator_type": "GPU",
+                        "memory_label": "VRAM",
+                    })
+                    uuid_to_index[gpu_uuid] = gpu_idx
+                except ValueError:
+                    continue
+
+        # 3. Parse Active compute apps (Section 1)
+        if len(sections) > 1:
+            proc_section = sections[1].strip()
+            for line in proc_section.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) < 4:
+                    continue
+                try:
+                    gpu_uuid = parts[0]
+                    pid = int(parts[1])
+                    proc_name = parts[2]
+                    used_mem = int(parts[3])
+                    
+                    # Resolve GPU index from UUID
+                    gpu_idx = uuid_to_index.get(gpu_uuid, -1)
+                    # If nvidia-smi failed or is missing, we don't have uuid_to_index,
+                    # but we can still store processes with gpu_idx = -1 if needed.
+                    if gpu_idx == -1 and not is_gpu_error:
+                        continue
+                        
+                    user = pid_to_user.get(pid, "unknown")
+                    processes.append({
+                        "gpu_index": gpu_idx,
+                        "pid": pid,
+                        "name": proc_name,
+                        "used_mem": used_mem,
+                        "user": user,
+                    })
+                except ValueError:
+                    continue
 
     # 4. Parse Quota (Section 3)
     if len(sections) > 3:
